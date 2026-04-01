@@ -73,7 +73,7 @@ void insertNodeAtAnyPos(int data, int pos){ // here pos is zero base
 void deleteNodeFromBeg(){
     if(head == NULL && tail == NULL)
     printf("list is empty !!!\n");
-    else if(head = tail){  // head->next == NULL
+    else if(head == tail){  // head->next == NULL
         head = tail = NULL;
         printf("Node deleted from Begining !!!\n");
     }
@@ -88,7 +88,7 @@ void deleteNodeFromBeg(){
 void deleteNodeFromEnd(){
     if(head == NULL && tail == NULL )
     printf("list is empty !!!\n");
-    else if(head = tail){  // head->next == NULL
+    else if(head == tail){  // head->next == NULL
         head = tail = NULL;
         printf("Node deleted from End !!!\n");
     }
