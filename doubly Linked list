@@ -147,12 +147,13 @@ void displayList(){
             printf("%d ", temp->data);
             temp = temp->next;
         }
+printf("\n");
     }
 
 }
 int main(){
 while(1){
-printf("\n***** Singly Linked List *****\n");
+printf("\n***** Doubly Linked List *****\n");
 printf("1. Insert In Begining\n");
 printf("2. Insert At End\n");
 printf("3. Insert At Specified Position\n");
