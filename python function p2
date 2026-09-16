@@ -1,0 +1,77 @@
+'''a='beautiful'
+#positive indexing
+print(a[:5])
+
+#negative indexing
+print(a[-3:])
+
+#Reverse
+print(a[::-1])
+print(a[5:])
+
+#skipping
+print(a[1:8:3])
+print(a[2:8:4])
+
+b='beauty lies'
+#length
+print(len(b))
+
+#length, count, find,capitalise
+print(b.endswith('y lies'))
+print(b.count('ie'))
+print(b.find('ie'))
+print(b.capitalize())
+
+#replace
+print(b.replace('bea','d'))
+
+#\t,\n,\',\\
+print("Hello\nworld")
+print("hello\tworld")
+print("hello","\n","world")
+
+print("It\'s the new world")
+print("\"It's the new world\"")
+print("Yes\\No")'''
+
+#1
+str=input("Enter string: ")
+print(len(str))
+#2
+name=input("Enter name: ")
+print(name.upper(),"\n",name.lower(),"\n",name.capitalize())
+#3
+str=input("Enter string: ")
+print(str[0])
+print(str[-1])
+#4
+name1=input("Enter first name: ")
+name2=input("Enter last name: ")
+print(name1," ",name2)
+#5
+name=input("Enter your name: ")
+print(name.upper(),"\n",name.lower(),"\n",name.capitalize())
+#6
+name=input("Enter college name: ")
+print(name,"\n",name.upper(),"\n",name.lower(),"\n",name.capitalize())
+#7
+name=input("Enter your word: ")
+print(len(name))
+print(name[0],"\t",name[-1])
+#8
+word="COMPUTER"
+print(word[0])
+print(word[2])
+print(word[4])
+print(word[-1])
+print(word[-2])
+#8
+str=input("Enter string: ")
+print(str[0:3])
+print(str[-3:])
+
+
+student = {"name" : "Riya"}                           
+print(student["name"])
+print(student.get("age","Not Available"))
