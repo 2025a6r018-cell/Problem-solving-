@@ -1,0 +1,105 @@
+'''a=int(input("Enter first number : "))
+b=int(input("Enter second number : "))
+print("Sum: ",a+b)
+print("Difference:" ,a-b)
+print("Product :",a*b )
+print("Division: ",a/b)
+print("Floor Division: ",a//b)
+print("Modulus: ",a%b)'''
+
+age = 23
+has_id = False
+print(age>=18 and has_id)
+print(age<18 or has_id)
+print(not has_id)
+print(type(age))
+
+'''d=input("Enter your name : ")
+print(len(d))'''
+
+print(max(12,34,67))
+print(min(12,34,67))
+print(round(5.66546364,2))
+set=[12,45,4365,0,8]
+print(sum(set))
+print(sorted(set))
+
+'''p=float(input("Enter principle: "))
+r=float(input("Enter rate: "))
+t= float(input("Enter time: "))
+si=(p*r*t)/100
+print("SI= ",si)
+
+a=int(input("Enter first number : "))
+b=int(input("Enter second number : "))
+c=int(input("Enter third number : "))
+print("Are numbers equal? ",a==b==c)
+age+=5
+print("After adding 5: ",age)
+age-=3
+print("After subtracting 3",age)
+age*=2
+print("After multiplication: ",age)
+age/=4
+print("After dividing: ",age)
+name=input("Enter your name : ")
+age=int(input("Enter your age "))
+print("Hello ",name," you are", age, " years old \nand your age in months is ",age*12)
+
+marks=int(input("Enter the marks: "))
+print("Student has passed the exam: ",marks>=40)
+n="23"
+print(len(n))
+
+#06
+a=int(input("Enter length : "))
+b=int(input("Enter breadth : "))
+print("Area: ",a*b)
+print("Perimeter: ",2*(a+b))
+
+#07
+a=int(input("Enter number : "))
+even=a%2
+print(even==0)
+
+#08
+a=int(input("Enter first number : "))
+b=int(input("Enter second number : "))
+print(max(a,b) ,min(a,b))
+
+#09
+name=input("Enter string: ")
+print(len(name))
+
+#10
+temp=float(input("Enter temperature: "))
+print("The temperature is above 0 and below 100: ", temp>0 and temp<100)'''
+
+#1
+f=float(input("Enter temperature in celsius: "))
+c=(f*9/5) +32
+print("Temperature in fahrenheit : ",c)
+
+#2
+r=float(input("Enter radius: "))
+print("circumference: ",2*3.14159*r)
+print("Area: ",3.14159*r*r)
+
+#3
+a=int(input("Enter first number : "))
+b=int(input("Enter second number : "))
+c=int(input("Enter third number : "))
+print(max(a,b,c) ,min(a,b,c))
+
+#4
+a=int(input("Enter year : "))
+even=a%4
+print(even==0)
+
+#5
+a=int(input("Enter first subject marks : "))
+b=int(input("Enter second subject marks : "))
+avg=(a+b)/2
+total=a+b
+print(avg,total)
+print("Average is above 40: ",avg>=40)
