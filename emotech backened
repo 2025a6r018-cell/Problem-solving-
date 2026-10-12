@@ -1,0 +1,316 @@
+import hashlib
+import hmac
+import csv
+import json
+import random
+import re
+import secrets
+import sqlite3
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
+import requests
+
+app = FastAPI(title="MoodMirror API", version="1.0.0")
+DATABASE_PATH = Path(__file__).with_name("emotion_history.db")
+TOKEN_LIFETIME_SECONDS = 12 * 60 * 60
+GOEMOTIONS_URL = "https://raw.githubusercontent.com/google-research/google-research/master/goemotions/data/train.tsv"
+GOEMOTIONS_LABELS = [
+    "admiration", "amusement", "anger", "annoyance", "approval", "caring",
+    "confusion", "curiosity", "desire", "disappointment", "disapproval",
+    "disgust", "embarrassment", "excitement", "fear", "gratitude", "grief",
+    "joy", "love", "nervousness", "optimism", "pride", "realization", "relief",
+    "remorse", "sadness", "surprise", "neutral",
+]
+GOEMOTIONS_TO_LABEL = {
+    "admiration": "joy",
+    "amusement": "joy",
+    "approval": "joy",
+    "excitement": "joy",
+    "gratitude": "joy",
+    "joy": "joy",
+    "optimism": "joy",
+    "pride": "joy",
+    "relief": "joy",
+    "disappointment": "sadness",
+    "embarrassment": "sadness",
+    "grief": "sadness",
+    "remorse": "sadness",
+    "sadness": "sadness",
+    "anger": "anger",
+    "annoyance": "anger",
+    "disapproval": "anger",
+    "disgust": "anger",
+    "fear": "fear",
+    "nervousness": "fear",
+    "caring": "love",
+    "desire": "love",
+    "love": "love",
+    "confusion": "surprise",
+    "curiosity": "surprise",
+    "realization": "surprise",
+    "surprise": "surprise",
+}
+MODEL_CACHE_PATH = Path(__file__).with_name("moodmirror_model.joblib")
+DATA_CACHE_PATH = Path(__file__).with_name("goemotions_train.tsv")
+LABELS = ["joy", "sadness", "anger", "fear", "love", "surprise"]
+GAME_EXAMPLES = {
+    "joy": ["I got the job I hoped for, and I cannot stop smiling.", "Spending the afternoon with my friends made me so happy."],
+    "sadness": ["I miss my old home and wish I could go back.", "It hurts that my best friend is moving far away."],
+    "anger": ["I am furious that they blamed me for something I did not do.", "It is unfair that nobody listened to my side."],
+    "fear": ["I heard a strange noise downstairs and am afraid to check.", "I am worried about the storm tonight."],
+    "love": ["I feel lucky to have such a caring family.", "I remember how much you mean to me."],
+    "surprise": ["I never expected everyone to show up for my birthday.", "The class gasped when the hidden door opened."],
+}
+class Credentials(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=8, max_length=256)
+
+
+class PredictionRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=5000)
+
+
+class GuessRequest(BaseModel):
+    game_id: str
+    guess: str
+
+
+@contextmanager
+def db():
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def initialize_database():
+    with db() as connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, salt TEXT NOT NULL, created_at TEXT NOT NULL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), expires_at INTEGER NOT NULL)")
+        connection.execute("CREATE TABLE IF NOT EXISTS predictions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, text TEXT NOT NULL, emotion TEXT NOT NULL, scores_json TEXT NOT NULL)")
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(predictions)")}
+        if "user_id" not in columns:
+            connection.execute("ALTER TABLE predictions ADD COLUMN user_id INTEGER REFERENCES users(id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_id ON predictions(user_id, id DESC)")
+        connection.execute("CREATE TABLE IF NOT EXISTS game_questions (game_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), text TEXT NOT NULL, answer TEXT NOT NULL, is_answered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)")
+
+
+def password_digest(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 250_000).hex()
+
+
+def issue_token(user_id):
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db() as connection:
+        connection.execute("INSERT INTO sessions VALUES (?, ?, ?)", (digest, user_id, int(time.time()) + TOKEN_LIFETIME_SECONDS))
+    return token
+
+
+def extract_token(authorization):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    return token
+
+
+def current_user(authorization: str | None = Header(default=None)):
+    token = extract_token(authorization)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with db() as connection:
+        row = connection.execute("SELECT users.id, users.username, sessions.expires_at FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token_hash = ?", (digest,)).fetchone()
+        if row is not None and row["expires_at"] < int(time.time()):
+            connection.execute("DELETE FROM sessions WHERE token_hash = ?", (digest,))
+            row = None
+    if row is None:
+        raise HTTPException(status_code=401, detail="Session expired. Sign in again.")
+    return {"id": row["id"], "username": row["username"]}
+
+
+def load_training_data():
+    if not DATA_CACHE_PATH.exists():
+        response = requests.get(GOEMOTIONS_URL, timeout=90)
+        response.raise_for_status()
+        DATA_CACHE_PATH.write_bytes(response.content)
+
+    texts = []
+    targets = []
+    with DATA_CACHE_PATH.open("r", encoding="utf-8", newline="") as data_file:
+        for row in csv.reader(data_file, delimiter="\t"):
+            if len(row) < 2:
+                continue
+            try:
+                label_ids = {int(value) for value in row[1].split(",")}
+            except ValueError:
+                continue
+            mapped = {
+                GOEMOTIONS_TO_LABEL[GOEMOTIONS_LABELS[label_id]]
+                for label_id in label_ids
+                if 0 <= label_id < len(GOEMOTIONS_LABELS)
+                and GOEMOTIONS_LABELS[label_id] in GOEMOTIONS_TO_LABEL
+            }
+            if len(mapped) == 1 and row[0].strip():
+                texts.append(row[0])
+                targets.append(mapped.pop())
+
+    if not texts or set(targets) != set(LABELS):
+        raise ValueError("The GoEmotions data did not contain usable examples for all six app emotions.")
+    return texts, targets
+
+
+@lru_cache(maxsize=1)
+def load_emotion_model():
+    import joblib
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+
+    if MODEL_CACHE_PATH.exists():
+        return joblib.load(MODEL_CACHE_PATH)
+
+    texts, targets = load_training_data()
+    model = make_pipeline(
+        TfidfVectorizer(
+            max_features=50_000,
+            ngram_range=(1, 2),
+            sublinear_tf=True,
+            strip_accents="unicode",
+            stop_words="english",
+        ),
+        LogisticRegression(
+            max_iter=300,
+            class_weight="balanced",
+            random_state=42,
+        ),
+    )
+    model.fit(texts, targets)
+    joblib.dump(model, MODEL_CACHE_PATH)
+    return model
+
+
+def predict_emotions(text):
+    try:
+        model = load_emotion_model()
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=f"The ML model could not load. Check scikit-learn, internet access, and Windows app-control permissions. ({error})",
+        ) from error
+
+    probabilities = model.predict_proba([text])[0]
+    scores = {
+        label: float(probability) * 100
+        for label, probability in zip(model.classes_, probabilities)
+    }
+    emotion = max(scores, key=scores.get)
+    return emotion, scores
+
+
+initialize_database()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/auth/register")
+def register(payload: Credentials):
+    username = payload.username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_.-]{3,32}", username):
+        raise HTTPException(status_code=422, detail="Use 3-32 letters, numbers, dots, dashes, or underscores.")
+    salt = secrets.token_bytes(16).hex()
+    try:
+        with db() as connection:
+            cursor = connection.execute("INSERT INTO users (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)", (username, password_digest(payload.password, salt), salt, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            user_id = cursor.lastrowid
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="That username is already in use.")
+    return {"access_token": issue_token(user_id), "username": username}
+
+
+@app.post("/auth/login")
+def login(payload: Credentials):
+    with db() as connection:
+        row = connection.execute("SELECT id, username, password_hash, salt FROM users WHERE username = ?", (payload.username.strip().lower(),)).fetchone()
+    if row is None or not hmac.compare_digest(password_digest(payload.password, row["salt"]), row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Username or password is incorrect.")
+    return {"access_token": issue_token(row["id"]), "username": row["username"]}
+
+
+@app.get("/auth/me")
+def me(user=Depends(current_user)):
+    return user
+
+
+@app.post("/auth/logout")
+def logout(authorization: str | None = Header(default=None), user=Depends(current_user)):
+    digest = hashlib.sha256(extract_token(authorization).encode("utf-8")).hexdigest()
+    with db() as connection:
+        connection.execute("DELETE FROM sessions WHERE token_hash = ?", (digest,))
+    return {"ok": True}
+
+
+@app.post("/predict")
+def analyze(payload: PredictionRequest, user=Depends(current_user)):
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Enter text to analyze.")
+    emotion, scores = predict_emotions(text)
+    with db() as connection:
+        connection.execute("INSERT INTO predictions (user_id, created_at, text, emotion, scores_json) VALUES (?, ?, ?, ?, ?)", (user["id"], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text, emotion, json.dumps(scores)))
+    return {"text": text, "emotion": emotion, "scores": scores}
+
+
+@app.get("/history")
+def history(user=Depends(current_user)):
+    with db() as connection:
+        rows = connection.execute("SELECT id, created_at, text, emotion, scores_json FROM predictions WHERE user_id = ? ORDER BY id DESC", (user["id"],)).fetchall()
+    return [{"id": row["id"], "created_at": row["created_at"], "text": row["text"], "emotion": row["emotion"], "scores": json.loads(row["scores_json"])} for row in rows]
+
+
+@app.delete("/history")
+def delete_history(user=Depends(current_user)):
+    with db() as connection:
+        connection.execute("DELETE FROM predictions WHERE user_id = ?", (user["id"],))
+    return {"ok": True}
+
+
+@app.post("/game/next")
+def next_question(user=Depends(current_user)):
+    answer = random.choice(LABELS)
+    text = random.choice(GAME_EXAMPLES[answer])
+    game_id = secrets.token_urlsafe(18)
+    with db() as connection:
+        connection.execute("DELETE FROM game_questions WHERE user_id = ? AND is_answered = 0", (user["id"],))
+        connection.execute("INSERT INTO game_questions (game_id, user_id, text, answer, created_at) VALUES (?, ?, ?, ?, ?)", (game_id, user["id"], text, answer, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    return {"game_id": game_id, "text": text, "labels": LABELS}
+
+
+@app.post("/game/guess")
+def submit_guess(payload: GuessRequest, user=Depends(current_user)):
+    if payload.guess not in LABELS:
+        raise HTTPException(status_code=422, detail="Choose a listed emotion.")
+    with db() as connection:
+        row = connection.execute("SELECT answer, is_answered FROM game_questions WHERE game_id = ? AND user_id = ?", (payload.game_id, user["id"])).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Question not found. Start a new round.")
+        if row["is_answered"]:
+            raise HTTPException(status_code=409, detail="This question was already answered.")
+        connection.execute("UPDATE game_questions SET is_answered = 1 WHERE game_id = ?", (payload.game_id,))
+    return {"correct": payload.guess == row["answer"], "answer": row["answer"]}
