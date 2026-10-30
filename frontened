@@ -1,0 +1,1604 @@
+"""InnerEcho: a small, personal space for emotion reflection."""
+
+import io
+import os
+from datetime import date
+from html import escape
+from urllib.parse import urlparse
+
+import altair as alt
+import pandas as pd
+import requests
+import streamlit as st
+
+
+st.set_page_config(
+    page_title="InnerEcho · a little room to understand",
+    page_icon="🎭",
+    layout="centered",
+    initial_sidebar_state="expanded",
+)
+
+API_URL = os.getenv("MOODMIRROR_API_URL", "http://127.0.0.1:8000").rstrip("/")
+EMOTIONS = ["joy", "sadness", "anger", "fear", "love", "surprise", "neutral", "uncertain"]
+EMOJIS = {
+    "joy": "☀️",
+    "sadness": "🌧️",
+    "anger": "🔥",
+    "fear": "🌙",
+    "love": "💙",
+    "surprise": "✨",
+    "neutral": "☁️",
+    "uncertain": "🫧",
+    }
+EMOTION_THEMES = {
+    "joy": {
+        "background": "#fffaf0",
+        "glow": "rgba(232, 180, 76, .20)",
+        "sidebar": "#fff3dc",
+        "accent": "#9a702e",
+        "hover": "#7f5c25",
+    },
+    "sadness": {
+        "background": "#f2f7fc",
+        "glow": "rgba(111, 159, 197, .20)",
+        "sidebar": "#e8f1fa",
+        "accent": "#4f789a",
+        "hover": "#3d617f",
+    },
+    "anger": {
+        "background": "#fff5f1",
+        "glow": "rgba(211, 117, 91, .17)",
+        "sidebar": "#f9eae5",
+        "accent": "#a75e49",
+        "hover": "#884a39",
+    },
+    "fear": {
+        "background": "#f6f4fb",
+        "glow": "rgba(142, 128, 183, .18)",
+        "sidebar": "#eeebf6",
+        "accent": "#71658f",
+        "hover": "#5a5074",
+    },
+    "love": {
+        "background": "#f2f9f6",
+        "glow": "rgba(104, 169, 145, .18)",
+        "sidebar": "#e7f2ed",
+        "accent": "#4e806d",
+        "hover": "#3d6757",
+    },
+    "surprise": {
+        "background": "#fff5fb",
+        "glow": "rgba(205, 128, 177, .18)",
+        "sidebar": "#f7eaf3",
+        "accent": "#9a6487",
+        "hover": "#7c4f6d",
+    },
+    "neutral": {
+        "background": "#f4f7f8",
+        "glow": "rgba(135, 164, 176, .16)",
+        "sidebar": "#eaf0f2",
+        "accent": "#5c7d8a",
+        "hover": "#496570",
+    },
+    "uncertain": {
+        "background": "#f8f6f1",
+        "glow": "rgba(173, 148, 106, .16)",
+        "sidebar": "#f1ede4",
+        "accent": "#88744f",
+        "hover": "#6d5d40",
+    },
+}
+FACE_COLORS = ["#f3cf9b", "#eab5a7", "#c5d6bd", "#c3d4e2", "#d5c6dc", "#e5d9b9"]
+FACE_EYES = ["• •", "◡ ◡", "✧ ✧", "– –"]
+FACE_MOUTHS = ["ᴗ", "﹏", "o", "‿"]
+FACE_ACCESSORIES = ["none", "tiny star", "leaf", "cap"]
+PAGES = [
+    "Dashboard",
+    "Emotion Detector",
+    "History",
+    "Feedback",
+    "Games",
+]
+class APIError(Exception):
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def api_request(method, path, token=None, payload=None, params=None):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        response = requests.request(
+            method,
+            f"{API_URL}{path}",
+            headers=headers,
+            json=payload,
+            params=params,
+            timeout=300 if path == "/predict" else 15,
+        )
+    except requests.Timeout as error:
+        message = (
+            "The analysis took too long. If this is the first analysis, the model may "
+            "still be training; wait a moment and try again."
+            if path == "/predict"
+            else "InnerEcho did not respond in time. Please try again."
+        )
+        raise APIError(
+            message
+        ) from error
+    except requests.RequestException as error:
+        raise APIError(
+            "I can't reach the InnerEcho service right now. Check that the backend is running."
+        ) from error
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if not response.ok:
+        raise APIError(str(data.get("detail", "That didn't work. Please try again.")), response.status_code)
+    return data
+
+
+@st.cache_resource(show_spinner=False)
+def load_speech_model():
+    from faster_whisper import WhisperModel
+
+    return WhisperModel("tiny", device="cpu", compute_type="int8")
+
+
+def transcribe_audio(audio_bytes):
+    model = load_speech_model()
+    segments, _ = model.transcribe(
+        io.BytesIO(audio_bytes),
+        beam_size=3,
+        vad_filter=True,
+    )
+    return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def reset_session():
+    for key, value in (
+        ("access_token", None),
+        ("username", None),
+        ("is_guest", False),
+        ("page", "Dashboard"),
+        ("auth_mode", "create"),
+        ("last_prediction", None),
+        ("prediction_text", ""),
+        ("game_question", None),
+        ("game_feedback", None),
+    ):
+        st.session_state[key] = value
+
+
+def sign_in(data):
+    st.session_state.access_token = data["access_token"]
+    st.session_state.username = data["username"]
+    st.session_state.is_guest = bool(data.get("is_guest", False))
+    st.session_state.page = "Dashboard"
+    st.session_state.last_prediction = None
+    st.session_state.prediction_text = ""
+    st.session_state.game_question = None
+    st.session_state.game_feedback = None
+
+
+def valid_source_url(value):
+    if not value.strip():
+        return True
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def brand():
+    st.markdown(
+        """
+        <div class="masthead">
+          <div class="brand-stamp">i<span>e</span></div>
+          <div>
+            <div class="brand-title">InnerEcho</div>
+            <div class="brand-subtitle">a little room to notice how you feel</div>
+          </div>
+          <div class="masthead-note">made for the in-between moments</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def section_title(eyebrow, title, description):
+    st.markdown(
+        f'<div class="eyebrow">{eyebrow}</div><div class="section-title">{title}</div>',
+        unsafe_allow_html=True,
+    )
+    st.write(description)
+
+
+def api_error_message(error):
+    st.error(str(error))
+
+
+def emotion_label(emotion):
+    return f"{EMOJIS.get(emotion, '🫧')} {emotion.title()}"
+
+
+def emotion_face_html(emotion, size=150, include_label=True):
+    emotion = (emotion or "neutral").lower()
+    theme = EMOTION_THEMES.get(emotion, EMOTION_THEMES["neutral"])
+    face_color = {
+        "joy": "#f4d087",
+        "sadness": "#b9d7ee",
+        "anger": "#f3b39c",
+        "fear": "#d7d0ef",
+        "love": "#bfe3d7",
+        "surprise": "#efc4db",
+        "neutral": "#dfe7eb",
+        "uncertain": "#e5d9b6",
+    }.get(emotion, "#dfe7eb")
+    eyes = {
+        "joy": "◕ ◕",
+        "sadness": "◡ ◡",
+        "anger": "× ×",
+        "fear": "• •",
+        "love": "♥ ♥",
+        "surprise": "◉ ◉",
+        "neutral": "– –",
+        "uncertain": "◌ ◌",
+    }.get(emotion, "– –")
+    mouth = {
+        "joy": "◠",
+        "sadness": "﹏",
+        "anger": "╱╲",
+        "fear": "o",
+        "love": "♥",
+        "surprise": "o",
+        "neutral": "ᴗ",
+        "uncertain": "~",
+    }.get(emotion, "ᴗ")
+    sparkle = "✦" if emotion in {"joy", "surprise", "love"} else ""
+    label = f'<div class="emotion-face-label">{emotion_label(emotion)}</div>' if include_label else ""
+    return f'''
+    <div class="emotion-face-wrap">
+      <div class="emotion-face" style="width:{size}px; height:{size}px; background:linear-gradient(180deg,{face_color}, #f7f7f7); border-color:{theme['accent']}; box-shadow:0 18px 40px {theme['glow']};">
+        <div class="emotion-face-shine"></div>
+        <div class="emotion-face-sparkle">{sparkle}</div>
+        <div class="emotion-face-eyes">{eyes}</div>
+        <div class="emotion-face-mouth">{mouth}</div>
+      </div>
+      {label}
+    </div>
+    '''
+
+
+for key, value in (
+    ("access_token", None),
+    ("username", None),
+    ("is_guest", False),
+    ("page", "Dashboard"),
+    ("auth_mode", "create"),
+    ("last_prediction", None),
+    ("prediction_text", ""),
+    ("game_question", None),
+    ("game_feedback", None),
+):
+    if key not in st.session_state:
+        st.session_state[key] = value
+if st.session_state.page not in PAGES:
+    st.session_state.page = "Dashboard"
+
+last_prediction = st.session_state.last_prediction
+active_emotion = (
+    last_prediction.get("emotion")
+    if isinstance(last_prediction, dict)
+    else None
+)
+emotion_theme = EMOTION_THEMES.get(
+    active_emotion,
+    {
+        "background": "#f4f6f7",
+        "glow": "rgba(186,207,222,.24)",
+        "sidebar": "#e8f0f7",
+        "accent": "#587d9e",
+        "hover": "#426782",
+    },
+)
+
+st.markdown(
+    """
+    <style>
+    :root {
+      --navy: #14283f; --navy-deep: __EMOTION_ACCENT__; --blue-hover: __EMOTION_HOVER__;
+      --emotion-background: __EMOTION_BACKGROUND__;
+      --emotion-glow: __EMOTION_GLOW__; --emotion-sidebar: __EMOTION_SIDEBAR__;
+      --wash: #eef3f7; --paper: #fbfaf7;
+      --line: #dce5eb; --muted: #6d7d8b; --gold: #c89453;
+    }
+    html, body, [class*="css"] {
+      font-family: 'Segoe UI Variable', 'Segoe UI', sans-serif;
+    }
+    :root { color-scheme: light; }
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+      background:
+        radial-gradient(circle at 8% 5%, color-mix(in srgb, var(--navy) 12%, transparent), transparent 28rem),
+        radial-gradient(circle at 92% 78%, rgba(255, 151, 188, .16), transparent 24rem),
+        linear-gradient(135deg, #fffaf3 0%, #f8fbff 55%, #f7f4ff 100%) !important;
+      color: #263746;
+      transition: background .35s ease;
+    }
+    .block-container { max-width: 1000px; padding: 1.7rem 2rem 4rem; }
+    [data-testid="stSidebar"] {
+      background:linear-gradient(180deg, rgba(255,255,255,.96), rgba(242,247,252,.96));
+      border-right:1px solid rgba(69,101,125,.12);
+      box-shadow:12px 0 40px rgba(55,82,104,.08);
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdown"] h1 {
+      font:900 25px 'Segoe UI Variable', sans-serif;
+      color:#263746;
+      text-transform:uppercase;
+      letter-spacing:2px;
+      text-shadow:none;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] > div { gap:7px; }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label {
+      min-height:46px; display:flex; align-items:center; padding:9px 13px;
+      border:1px solid transparent; border-left:3px solid transparent;
+      border-radius:12px 4px 12px 4px;
+      background:transparent; color:#5c7080 !important; font-weight:750;
+      text-transform:uppercase; letter-spacing:.55px;
+      transition:.18s ease;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+      transform:translateX(4px); color:#263746 !important;
+      background:rgba(255,255,255,.9) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {
+      display:none;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+      border-color:color-mix(in srgb, var(--blue) 55%, transparent); border-left-color:var(--blue);
+      background:linear-gradient(90deg, color-mix(in srgb, var(--blue) 16%, white), rgba(255,255,255,.92)) !important;
+      color:#263746 !important;
+      box-shadow:0 5px 18px rgba(55,82,104,.08);
+    }
+    h1, h2, h3 { color: #263746 !important; }
+    .section-title {
+      font-family:'Segoe UI Variable Display','Segoe UI',sans-serif !important;
+      font-weight:900 !important;
+      text-transform:uppercase;
+      letter-spacing:-1.5px;
+      color:#263746 !important;
+      text-shadow:none;
+    }
+    .brand-title { color:#263746 !important; }
+    .brand-subtitle, .masthead-note { color:#718397 !important; }
+    [data-testid="stCaptionContainer"], .stCaption, .eyebrow { color:#718397 !important; }
+    ::selection { background: color-mix(in srgb, var(--blue) 42%, white); }
+    [data-testid="stAppViewContainer"] { overflow-x: hidden; }
+    .block-container {
+      animation: fade-in .35s ease-out;
+      max-width: 1120px;
+    }
+    @keyframes fade-in { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    [data-testid="stSidebar"] [data-testid="stSidebarContent"] { padding: 1rem 0.8rem 1.4rem; }
+    [data-testid="stSidebar"] .stCaption { letter-spacing: .6px; }
+    [data-testid="stSidebarUserContent"] { padding: .5rem; }
+    .section-title { text-shadow: 0 1px rgba(255,255,255,.8); }
+    [data-testid="stMetric"] {
+      background:linear-gradient(145deg, rgba(255,255,255,.94), rgba(255,255,255,.72));
+      border:1px solid rgba(69,101,125,.12);
+      border-top:3px solid var(--blue);
+      border-radius:14px 4px 14px 4px;
+      box-shadow:0 12px 30px rgba(55,82,104,.09);
+      backdrop-filter:blur(14px);
+      padding:.9rem 1rem;
+    }
+    [data-testid="stMetricValue"], [data-testid="stMetricDelta"] { color:#263746 !important; }
+    [data-testid="stMetricLabel"] { color:#718397 !important; }
+    [data-testid="stForm"] {
+      background:rgba(255,255,255,.82);
+      border:1px solid rgba(69,101,125,.12);
+      box-shadow:0 18px 45px rgba(55,82,104,.08);
+      backdrop-filter:blur(16px);
+    }
+    .result-slip {
+      background:rgba(255,255,255,.88);
+      border-left:4px solid var(--blue);
+      color:#4e6171;
+      box-shadow:0 16px 36px rgba(55,82,104,.09);
+      line-height:1.65;
+      border-radius:4px 14px 14px 4px;
+    }
+    .hand-note {
+      background:rgba(255,255,255,.86);
+      border:1px solid rgba(69,101,125,.12);
+      color:#526878;
+      box-shadow:0 16px 36px rgba(55,82,104,.09);
+    }
+    div[data-testid="stDataFrame"] {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      background: rgba(255,255,255,.78);
+    }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--blue) 35%, transparent); border-radius: 999px; }
+    .masthead { display:flex; align-items:center; gap:14px; padding:7px 0 18px; border-bottom:1px solid var(--line); margin-bottom:22px; }
+    .brand-stamp { width:43px; height:43px; display:grid; place-items:center; border:1.5px solid var(--blue); border-radius:50% 50% 44% 56%; color:var(--blue); font:600 22px Georgia,serif; transform:rotate(-5deg); }
+    .brand-stamp span { color:var(--gold); font-style:italic; }
+    .brand-title { font:600 26px Georgia,serif; letter-spacing:-.6px; color:var(--ink); }
+    .brand-subtitle { color:var(--muted); font-size:12px; letter-spacing:.25px; margin-top:-2px; }
+    .masthead-note { margin-left:auto; font:11px Consolas,monospace; color:#84919c; letter-spacing:.3px; }
+    .auth-intro {
+      padding:30px 26px; border:1px solid rgba(255,255,255,.1); border-radius:18px 5px 18px 5px;
+      background:
+        radial-gradient(circle at 82% 18%, color-mix(in srgb,var(--blue) 20%,transparent), transparent 10rem),
+        linear-gradient(150deg,rgba(255,255,255,.09),rgba(255,255,255,.025));
+      box-shadow:0 24px 60px rgba(0,0,0,.28);
+      backdrop-filter:blur(18px);
+    }
+    .auth-intro-mark {
+      width:54px; height:54px; display:grid; place-items:center; margin-bottom:25px;
+      border-radius:15px; background:#d5e4f0; color:#315c7d; font-size:28px;
+    }
+    .auth-intro-title {
+      font:900 38px 'Segoe UI Variable Display','Segoe UI',sans-serif; line-height:1.02;
+      color:#fff; text-transform:uppercase; letter-spacing:-1px;
+    }
+    .auth-intro-copy { max-width:310px; margin-top:14px; color:#b9bdca; line-height:1.65; }
+    .auth-card {
+      padding:24px 25px 20px; border:1px solid rgba(255,255,255,.1); border-radius:14px 18px 14px 18px;
+      background:linear-gradient(145deg,rgba(255,255,255,.09),rgba(255,255,255,.035));
+      box-shadow:0 24px 60px rgba(0,0,0,.28); backdrop-filter:blur(18px);
+    }
+    .auth-card-title { margin-bottom:4px; font:800 27px 'Segoe UI Variable Display','Segoe UI',sans-serif; color:#fff; text-transform:uppercase; }
+    .auth-card-subtitle { margin-bottom:18px; color:#b1b5c4; font-size:13px; }
+    .auth-switch { padding-top:13px; color:#969bab; text-align:center; font-size:13px; }
+    .st-key-guest-actions .stButton > button {
+      color:#fff; background:#315f85; border:1px solid #274f70;
+      box-shadow:0 4px 10px rgba(37,78,111,.18);
+    }
+    .st-key-guest-actions .stButton > button:hover {
+      color:#fff; background:#254d6e; border-color:#254d6e;
+      box-shadow:0 6px 13px rgba(37,78,111,.22);
+    }
+    .eyebrow { font:11px Consolas,monospace; text-transform:uppercase; letter-spacing:1.5px; color:var(--blue); margin:4px 0 6px; }
+    .section-title { font:600 32px Georgia,serif; letter-spacing:-.6px; color:var(--ink); }
+    .hand-note { background:#fffdf7; border:1px solid #ece4d4; border-radius:4px 12px 5px 10px; padding:15px 18px; color:#5e6d79; }
+    [data-testid="stForm"] {
+      background:linear-gradient(145deg,rgba(255,255,255,.08),rgba(255,255,255,.025));
+      border:1px solid rgba(255,255,255,.09); border-top:2px solid var(--blue);
+      border-radius:14px 4px 14px 4px; padding:1.2rem;
+      box-shadow:0 18px 45px rgba(0,0,0,.22);
+    }
+    [data-testid="stMetric"] {
+      background:linear-gradient(145deg,rgba(255,255,255,.09),rgba(255,255,255,.035));
+      border:1px solid rgba(255,255,255,.09); border-top:2px solid var(--blue);
+      border-radius:14px 4px 14px 4px; padding:.9rem 1rem;
+    }
+    [data-testid="stMetricLabel"] { color:#aaaec0 !important; }
+    .stButton > button, [data-testid="stFormSubmitButton"] > button {
+      border:1px solid color-mix(in srgb,var(--blue) 80%,white 20%); color:#fff;
+      background:linear-gradient(135deg,var(--blue),color-mix(in srgb,var(--blue) 70%,#2b163f));
+      border-radius:12px 3px 12px 3px;
+      font-weight:800; text-transform:uppercase; letter-spacing:.55px;
+      min-height:2.55rem; transition:transform .15s, box-shadow .15s, filter .15s;
+      box-shadow:0 8px 24px color-mix(in srgb,var(--blue) 18%,transparent);
+    }
+    .stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {
+      background:linear-gradient(135deg,var(--blue-hover),var(--blue)); color:white;
+      border-color:white; transform:translateY(-2px);
+      box-shadow:0 12px 30px color-mix(in srgb,var(--blue) 28%,transparent);
+      filter:brightness(1.08);
+    }
+    [data-testid="stRadio"] > div { gap:7px; }
+    [data-testid="stRadio"] label { border:1px solid var(--line); background:rgba(255,255,255,.76); padding:6px 12px; border-radius:7px 11px 8px 10px; }
+    [data-testid="stRadio"] label:has(input:checked) { background:#dce8f0; border-color:#9db4c7; }
+    [data-testid="stTabs"] [role="tablist"] {
+      gap:5px; padding:5px; background:#e9f0f6; border:1px solid #d7e2ec;
+      border-radius:9px; border-bottom:1px solid #d7e2ec;
+    }
+    [data-testid="stTabs"] button[role="tab"] {
+      min-height:38px; justify-content:center; border:1px solid transparent;
+      border-radius:6px; color:#50677c; font-weight:600;
+      background:transparent; transition:background .15s, color .15s, box-shadow .15s;
+    }
+    [data-testid="stTabs"] button[role="tab"]:hover {
+      color:#294968; background:#f7fafd;
+    }
+    [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+      color:#234969; background:#fff; border-color:#d2dee8;
+      box-shadow:0 1px 2px rgba(32,54,76,.08);
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"] { display:none; }
+    div[data-baseweb="input"] > div, div[data-baseweb="textarea"] > div, div[data-baseweb="select"] > div {
+      border-radius:9px 3px 9px 3px; background:rgba(255,255,255,.055);
+      border-color:rgba(255,255,255,.12) !important;
+      color:#fff;
+    }
+    [data-testid="stWidgetLabel"], label { color:#c9ccd7 !important; }
+    [data-testid="stTabs"] [role="tablist"] {
+      gap:6px; padding:6px; background:rgba(255,255,255,.055); border:1px solid rgba(255,255,255,.08);
+      border-radius:14px 4px 14px 4px;
+    }
+    [data-testid="stTabs"] button[role="tab"] { color:#adb1c0; background:transparent; }
+    [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+      color:#fff; background:color-mix(in srgb,var(--blue) 28%,#171925);
+      border-color:color-mix(in srgb,var(--blue) 55%,transparent);
+      box-shadow:0 0 18px color-mix(in srgb,var(--blue) 12%,transparent);
+    }
+    div[data-testid="stDataFrame"] {
+      border:1px solid rgba(255,255,255,.09); background:rgba(255,255,255,.035);
+    }
+    hr { border-color:rgba(255,255,255,.08); }
+    .result-slip { border-left:3px solid var(--gold); background:#fffdf8; padding:17px 20px; border-radius:2px 12px 8px 2px; }
+    .custom-face { position:relative; width:124px; height:124px; border:3px solid rgba(32,54,76,.2); border-radius:48% 52% 45% 55%; display:grid; place-items:center; font-size:58px; margin:8px auto 14px; box-shadow:5px 7px 0 rgba(32,54,76,.08); }
+    .emotion-face-wrap { display:flex; flex-direction:column; align-items:center; gap:8px; margin:0.5rem auto 1rem; }
+    .emotion-face {
+      position:relative; display:grid; place-items:center; border:3px solid rgba(32,54,76,.2);
+      border-radius:48% 52% 45% 55%; transform:rotate(-4deg); overflow:hidden; 
+      transition:transform .25s ease, box-shadow .25s ease;
+    }
+    .emotion-face:hover { transform:rotate(0deg) scale(1.02); }
+    .emotion-face-shine {
+      position:absolute; inset:10% 18% auto auto; width:24%; height:24%; border-radius:50%;
+      background:rgba(255,255,255,.44); filter:blur(4px);
+    }
+    .emotion-face-sparkle {
+      position:absolute; top:12%; right:16%; font-size:18px; color:#fff8d8; text-shadow:0 0 12px rgba(255,255,255,.7);
+    }
+    .emotion-face-eyes { font-size:1.6rem; letter-spacing:0.15rem; color:#20364c; margin-top:12px; }
+    .emotion-face-mouth { font-size:2.2rem; line-height:1; color:#20364c; margin-top:4px; }
+    .emotion-face-label { font-weight:700; letter-spacing:0.04rem; color:var(--ink); }
+    .footer-note {
+      border-top:1px solid rgba(255,255,255,.08); margin-top:3rem; padding-top:14px;
+      color:#777d91; font:10px Consolas,monospace; letter-spacing:.4px;
+    }
+    .masthead {
+      border-bottom:1px solid rgba(255,255,255,.08);
+      padding-bottom:18px;
+    }
+    .brand-stamp {
+      border:2px solid var(--blue); border-radius:50%; color:#fff;
+      box-shadow:0 0 22px color-mix(in srgb,var(--blue) 30%,transparent);
+      background:linear-gradient(135deg, color-mix(in srgb,var(--blue) 45%,#171925),rgba(255,255,255,.04));
+      transform:rotate(-6deg);
+    }
+    .emotion-face {
+      border-width:4px !important;
+      box-shadow:0 0 35px var(--emotion-glow), inset 0 0 24px rgba(255,255,255,.45) !important;
+    }
+    .emotion-face:hover { filter:brightness(1.06); }
+    [data-testid="stProgress"] > div > div { background:linear-gradient(90deg,var(--blue),#ff4f91); }
+    .custom-face {
+      box-shadow:0 18px 40px rgba(0,0,0,.28), 0 0 28px var(--emotion-glow);
+      border:3px solid rgba(255,255,255,.25);
+    }
+    /* Playful candy palette */
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+      background:
+        radial-gradient(circle at 8% 8%, rgba(255, 210, 112, .24), transparent 18rem),
+        radial-gradient(circle at 92% 20%, rgba(255, 151, 188, .22), transparent 20rem),
+        radial-gradient(circle at 70% 92%, rgba(132, 215, 199, .20), transparent 20rem),
+        linear-gradient(135deg, #fffaf2 0%, #f5fbff 48%, #fdf4ff 100%) !important;
+    }
+    [data-testid="stSidebar"] {
+      background:linear-gradient(180deg, #fff6cb 0%, #e9f9ff 55%, #fcecff 100%) !important;
+      border-right:3px solid rgba(255,255,255,.85);
+      box-shadow:10px 0 30px rgba(123,143,173,.12);
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdown"] h1 {
+      color:#5b5b9e !important;
+      letter-spacing:1px;
+      text-shadow:0 3px 0 #fff;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label {
+      color:#66739c !important;
+      border-radius:18px 18px 18px 6px;
+      border:2px solid transparent;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+      color:#5b5b9e !important;
+      background:#fff !important;
+      transform:rotate(-1deg) translateX(4px);
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+      border-color:#ffc7df;
+      border-left-color:#ff91b8;
+      background:linear-gradient(90deg,#ffe7f1,#fff) !important;
+      color:#b85d7c !important;
+      box-shadow:0 5px 14px rgba(223,146,179,.16);
+    }
+    .brand-stamp {
+      border-radius:50% 44% 55% 48%;
+      border-color:#ff9abd;
+      background:#fff4f8;
+      box-shadow:0 7px 0 #f8d5e2;
+    }
+    .brand-title { color:#5b5b9e !important; letter-spacing:-1px; }
+    .brand-subtitle, .masthead-note, .stCaption { color:#8191a5 !important; }
+    h1, h2, h3, .section-title, .auth-card-title, .auth-intro-title { color:#56578d !important; }
+    .section-title, .auth-card-title, .auth-intro-title {
+      text-shadow:0 4px 0 rgba(255,255,255,.95);
+    }
+    .eyebrow { color:#ff8dac !important; }
+    [data-testid="stMetric"], [data-testid="stForm"], .auth-card, .auth-intro,
+    .result-slip, .hand-note, div[data-testid="stDataFrame"] {
+      border-radius:22px 22px 22px 8px !important;
+      border:3px solid rgba(255,255,255,.95) !important;
+      box-shadow:0 10px 0 rgba(151,177,196,.12), 0 16px 35px rgba(123,143,173,.10) !important;
+    }
+    [data-testid="stMetric"] {
+      background:linear-gradient(145deg,#ffffff,#fff7e8) !important;
+      border-top-color:#ffd56a !important;
+    }
+    [data-testid="stMetricLabel"] { color:#8191a5 !important; }
+    [data-testid="stMetricValue"] { color:#5b5b9e !important; }
+    [data-testid="stForm"] {
+      background:rgba(255,255,255,.88) !important;
+      border-top:4px solid #8fd9c7 !important;
+    }
+    .auth-card { background:rgba(255,255,255,.90) !important; }
+    .auth-intro {
+      background:linear-gradient(145deg,#fff7cf,#eaf9ff 70%,#f9efff) !important;
+      border:3px solid rgba(255,255,255,.95) !important;
+    }
+    .auth-intro-copy, .auth-card-subtitle, .auth-switch { color:#71839a !important; }
+    .auth-intro-mark {
+      border-radius:50% 50% 45% 55%; background:#fff; color:#ff8dac;
+      box-shadow:0 7px 0 #f8d9b0;
+    }
+    .stButton > button, [data-testid="stFormSubmitButton"] > button {
+      border:3px solid #fff !important;
+      border-radius:18px 18px 18px 7px !important;
+      background:linear-gradient(135deg,#7ed9c7,#6fbad3) !important;
+      color:#fff !important;
+      box-shadow:0 7px 0 #53a6ad, 0 10px 18px rgba(83,166,173,.14) !important;
+      text-transform:none;
+    }
+    .stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {
+      background:linear-gradient(135deg,#ffafc7,#ff91b8) !important;
+      box-shadow:0 7px 0 #d9799d, 0 12px 20px rgba(217,121,157,.16) !important;
+      transform:translateY(-2px) rotate(-1deg);
+    }
+    [data-testid="stTabs"] [role="tablist"] {
+      background:#fff !important; border:3px solid #f8dfec !important;
+      border-radius:18px !important;
+    }
+    [data-testid="stTabs"] button[role="tab"] { color:#71839a !important; }
+    [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+      color:#5b5b9e !important; background:#fff0f6 !important;
+      border-color:#ffc9df !important; box-shadow:0 4px 10px rgba(217,121,157,.10);
+    }
+    div[data-baseweb="input"] > div, div[data-baseweb="textarea"] > div, div[data-baseweb="select"] > div {
+      background:#fff !important; border:2px solid #d7ebf0 !important;
+      border-radius:14px 14px 14px 5px !important; color:#566a7a !important;
+    }
+    [data-testid="stWidgetLabel"], label { color:#667a8e !important; }
+    .result-slip { background:#fff !important; color:#607486 !important; border-left:6px solid #ffd56a !important; }
+    .hand-note { background:#fff !important; color:#607486 !important; }
+    .footer-note { border-top:2px dashed #d8e7ec; color:#93a0aa; }
+    .custom-face { border:4px solid #fff; box-shadow:0 10px 0 #e4cfe0, 0 18px 35px rgba(123,143,173,.16) !important; }
+    /* Nature-green theme */
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+      background:
+        radial-gradient(circle at 9% 7%, rgba(255, 224, 138, .20), transparent 18rem),
+        radial-gradient(circle at 88% 18%, rgba(128, 196, 164, .22), transparent 21rem),
+        radial-gradient(circle at 72% 88%, rgba(196, 221, 160, .20), transparent 20rem),
+        linear-gradient(135deg, #fbfcf5 0%, #eef8f0 52%, #edf5ec 100%) !important;
+    }
+    [data-testid="stSidebar"] {
+      background:linear-gradient(180deg, #edf4dc 0%, #dff1e4 55%, #edf4ed 100%) !important;
+      border-right:3px solid rgba(255,255,255,.90);
+      box-shadow:10px 0 30px rgba(76,123,93,.10);
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdown"] h1,
+    h1, h2, h3, .section-title, .auth-card-title, .auth-intro-title,
+    .brand-title, [data-testid="stMetricValue"] { color:#476b55 !important; }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label {
+      color:#667e69 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+      border-color:#b6d6a9;
+      border-left-color:#7baa78;
+      background:linear-gradient(90deg,#f7fbd9,#fff) !important;
+      color:#557c54 !important;
+    }
+    .brand-stamp {
+      border-color:#88ad7b;
+      background:#f5fae5;
+      box-shadow:0 7px 0 #c9ddb5;
+      color:#557c54;
+    }
+    .brand-subtitle, .masthead-note, .stCaption, [data-testid="stCaptionContainer"],
+    .auth-intro-copy, .auth-card-subtitle, .auth-switch, [data-testid="stWidgetLabel"], label {
+      color:#728a78 !important;
+    }
+    .eyebrow { color:#7da052 !important; }
+    [data-testid="stMetric"], [data-testid="stForm"], .auth-card, .auth-intro,
+    .result-slip, .hand-note, div[data-testid="stDataFrame"] {
+      border-color:rgba(255,255,255,.95) !important;
+      box-shadow:0 10px 0 rgba(118,157,125,.10), 0 16px 35px rgba(76,123,93,.08) !important;
+    }
+    [data-testid="stMetric"] { background:linear-gradient(145deg,#ffffff,#f8faeb) !important; border-top-color:#a6c883 !important; }
+    [data-testid="stMetricLabel"] { color:#728a78 !important; }
+    [data-testid="stForm"] { background:rgba(255,255,255,.88) !important; border-top-color:#89b88a !important; }
+    .auth-card { background:rgba(255,255,255,.90) !important; }
+    .auth-intro { background:linear-gradient(145deg,#f7f1c9,#eaf6e5 70%,#eef5df) !important; }
+    .auth-intro-mark { background:#fff; color:#7ba66e; box-shadow:0 7px 0 #d3dfb8; }
+    .stButton > button, [data-testid="stFormSubmitButton"] > button {
+      border-color:#fff !important;
+      background:linear-gradient(135deg,#8ebc83,#6d9f7b) !important;
+      color:#fff !important;
+      box-shadow:0 7px 0 #557e61, 0 10px 18px rgba(83,126,97,.14) !important;
+    }
+    .stButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover {
+      background:linear-gradient(135deg,#b6c95c,#86ad68) !important;
+      box-shadow:0 7px 0 #789746, 0 12px 20px rgba(120,151,70,.16) !important;
+    }
+    [data-testid="stTabs"] [role="tablist"] { background:#fff !important; border-color:#d9e8cf !important; }
+    [data-testid="stTabs"] button[role="tab"] { color:#728a78 !important; }
+    [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+      color:#557c54 !important; background:#edf7df !important;
+      border-color:#b6d6a9 !important;
+    }
+    div[data-baseweb="input"] > div, div[data-baseweb="textarea"] > div, div[data-baseweb="select"] > div {
+      background:#fff !important; border-color:#d5e5cf !important; color:#557060 !important;
+    }
+    .result-slip { background:#fff !important; color:#607a68 !important; border-left-color:#b3cc7c !important; }
+    .hand-note { background:#fff !important; color:#607a68 !important; }
+    .footer-note { border-top-color:#cfdcca; color:#829487; }
+    [data-testid="stProgress"] > div > div { background:linear-gradient(90deg,#8db981,#b0ca72) !important; }
+    .custom-face { border-color:#fff; box-shadow:0 10px 0 #cbdcbc, 0 18px 35px rgba(76,123,93,.14) !important; }
+    .auth-shell { max-width: 920px; margin: 0 auto; }
+    .auth-intro { min-height: 420px; display:flex; flex-direction:column; justify-content:center; }
+    .auth-card { min-height:420px; }
+    .auth-feature-row { display:flex; gap:8px; flex-wrap:wrap; margin-top:20px; }
+    .auth-feature {
+      padding:7px 10px; border-radius:999px; border:1px solid rgba(255,255,255,.9);
+      background:rgba(255,255,255,.78); color:#647969; font-size:12px;
+      box-shadow:0 4px 10px rgba(76,123,93,.07);
+    }
+    .tracker-card {
+      height:100%; min-height:145px; border:1px solid rgba(255,255,255,.95);
+      border-radius:18px; background:rgba(255,255,255,.92);
+      box-shadow:0 10px 24px rgba(76,123,93,.08); padding:18px 20px;
+    }
+    /* Keep the interface at a normal, readable desktop scale. */
+    html, body, [class*="css"] {
+      font-size:14px;
+    }
+    .block-container {
+      max-width:1180px !important;
+      padding:1.25rem 2rem 3rem !important;
+    }
+    [data-testid="stVerticalBlock"] {
+      gap:.75rem;
+    }
+    [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+      padding-top:.75rem;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdown"] h1 {
+      font-size:21px !important;
+      letter-spacing:1px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label {
+      min-height:38px !important;
+      padding:7px 10px !important;
+    }
+    .masthead {
+      gap:12px;
+      padding:4px 0 14px !important;
+      margin-bottom:16px !important;
+    }
+    .brand-title { font-size:24px !important; }
+    .brand-subtitle { font-size:12px !important; }
+    .section-title {
+      font-size:30px !important;
+      letter-spacing:-.8px !important;
+    }
+    h3 {
+      font-size:18px !important;
+    }
+    [data-testid="stMetric"] {
+      padding:.75rem 1rem !important;
+    }
+    .stButton > button, [data-testid="stFormSubmitButton"] > button {
+      min-height:40px !important;
+      font-size:14px !important;
+      padding:.45rem .9rem !important;
+    }
+    .auth-intro {
+      min-height:340px !important;
+      padding:24px 26px !important;
+    }
+    .auth-card {
+      min-height:340px !important;
+      padding:20px 24px !important;
+    }
+    .auth-intro-title {
+      font-size:32px !important;
+    }
+    .auth-card-title {
+      font-size:24px !important;
+    }
+    .auth-intro-mark {
+      width:46px !important;
+      height:46px !important;
+      margin-bottom:16px !important;
+      font-size:24px !important;
+    }
+    .tracker-card {
+      min-height:125px !important;
+      padding:14px 16px !important;
+    }
+    .tracker-card-title { font-size:13px; font-weight:800; color:#476b55; margin-bottom:8px; }
+    .tracker-card-subtitle { font-size:11px; color:#8a9a91; margin-bottom:12px; }
+    .mood-legend { display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; }
+    .mood-chip { min-width:48px; text-align:center; color:#607a68; font-size:11px; }
+    .mood-chip-dot {
+      width:44px; height:44px; border-radius:50%; display:grid; place-items:center;
+      margin:0 auto 5px; background:#f3f7f1; border:2px solid rgba(255,255,255,.95);
+      font-size:21px; box-shadow:0 4px 10px rgba(76,123,93,.08);
+    }
+    .reflection-row {
+      border-bottom:1px solid #edf1ec; padding:12px 0;
+    }
+    .reflection-row:last-child { border-bottom:0; }
+    @media(max-width:700px) { .block-container{padding:1rem 1rem 3rem}.masthead-note{display:none}.section-title{font-size:27px}.auth-intro-title{font-size:32px} }
+    </style>
+    """
+    .replace("__EMOTION_ACCENT__", emotion_theme["accent"])
+    .replace("__EMOTION_HOVER__", emotion_theme["hover"])
+    .replace("__EMOTION_BACKGROUND__", emotion_theme["background"])
+    .replace("__EMOTION_GLOW__", emotion_theme["glow"])
+    .replace("__EMOTION_SIDEBAR__", emotion_theme["sidebar"]),
+    unsafe_allow_html=True,
+)
+
+
+if not st.session_state.access_token:
+    brand()
+    notice = st.session_state.pop("notice", None)
+    if notice:
+        st.info(notice)
+    left, right = st.columns([.9, 1.1], gap="large", vertical_alignment="center")
+    with left:
+        st.markdown(
+            '<div class="auth-intro"><div class="auth-intro-mark">🎭</div>'
+            '<div class="eyebrow">INNER ECHO</div>'
+            '<div class="auth-intro-title">A clearer space<br>to check in.</div>'
+            '<div class="auth-intro-copy">Create a private profile to keep your '
+            'reflections together, see your mood patterns, and return whenever you need a pause.</div>'
+            '<div class="auth-feature-row"><span class="auth-feature">Private journal</span>'
+            '<span class="auth-feature">Mood insights</span><span class="auth-feature">No pressure</span></div></div>',
+            unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown('<div class="auth-card">', unsafe_allow_html=True)
+        if st.session_state.auth_mode == "create":
+            st.markdown(
+                '<div class="auth-card-title">Create your account</div>'
+                '<div class="auth-card-subtitle">Your name and a private PIN are all you need.</div>',
+                unsafe_allow_html=True,
+            )
+            with st.form("profile_create_form"):
+                profile_name = st.text_input("Name", max_chars=32)
+                birth_date = st.date_input(
+                    "Date of birth",
+                    value=None,
+                    min_value=date(1900, 1, 1),
+                    max_value=date.today(),
+                    format="YYYY-MM-DD",
+                )
+                new_pin = st.text_input("PIN (4–12 digits)", type="password", max_chars=12)
+                confirm_pin = st.text_input("Confirm PIN", type="password", max_chars=12)
+                create_account = st.form_submit_button(
+                    "Create account", type="primary", use_container_width=True
+                )
+            if create_account:
+                if not profile_name.strip():
+                    st.error("Enter your name.")
+                elif birth_date is None:
+                    st.error("Choose your date of birth.")
+                elif not new_pin.isdigit() or not 4 <= len(new_pin) <= 12:
+                    st.error("Your PIN must contain 4–12 digits.")
+                elif new_pin != confirm_pin:
+                    st.error("The PINs do not match.")
+                else:
+                    try:
+                        sign_in(
+                            api_request(
+                                "POST",
+                                "/profiles/create",
+                                payload={
+                                    "username": profile_name.strip(),
+                                    "display_name": profile_name.strip(),
+                                    "date_of_birth": birth_date.isoformat(),
+                                    "pin": new_pin,
+                                },
+                            )
+                        )
+                        st.rerun()
+                    except APIError as error:
+                        api_error_message(error)
+            st.markdown(
+                '<div class="auth-switch">Already have an account?</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Log in", key="show_login", use_container_width=True):
+                st.session_state.auth_mode = "login"
+                st.rerun()
+        else:
+            st.markdown(
+                '<div class="auth-card-title">Welcome back</div>'
+                '<div class="auth-card-subtitle">Enter your name and PIN to continue.</div>',
+                unsafe_allow_html=True,
+            )
+            with st.form("profile_open_form"):
+                login_name = st.text_input("Name", max_chars=32)
+                login_pin = st.text_input("PIN", type="password", max_chars=12)
+                login_submitted = st.form_submit_button(
+                    "Log in", type="primary", use_container_width=True
+                )
+            if login_submitted:
+                try:
+                    sign_in(
+                        api_request(
+                            "POST",
+                            "/profiles/open",
+                            payload={"username": login_name.strip(), "pin": login_pin},
+                        )
+                    )
+                    st.rerun()
+                except APIError as error:
+                    api_error_message(error)
+            st.markdown(
+                '<div class="auth-switch">New to InnerEcho?</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Create an account", key="show_create", use_container_width=True):
+                st.session_state.auth_mode = "create"
+                st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="auth-switch">Just exploring?</div>', unsafe_allow_html=True)
+    guest_col, _ = st.columns([1, 1])
+    with guest_col:
+        if st.button(
+            "Sign in as a guest",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                sign_in(api_request("POST", "/profiles/guest"))
+                st.rerun()
+            except APIError as error:
+                api_error_message(error)
+    st.stop()
+
+
+try:
+    user = api_request("GET", "/auth/me", token=st.session_state.access_token)
+except APIError as error:
+    reset_session()
+    if error.status_code == 401:
+        st.info("Your session has expired. Sign in again when you're ready.")
+    else:
+        api_error_message(error)
+    st.stop()
+
+brand()
+notice = st.session_state.pop("notice", None)
+if notice:
+    st.info(notice)
+user_col, logout_col = st.columns([5, 1])
+with user_col:
+    if user["is_guest"]:
+        st.caption(f"Guest profile · `{user['username']}`")
+    else:
+        st.caption(f"Your space · **{user['display_name']}**")
+with logout_col:
+    if st.button("Sign out", use_container_width=True):
+        try:
+            api_request("POST", "/auth/logout", token=st.session_state.access_token)
+        except APIError as error:
+            st.session_state.notice = (
+                "You were signed out here, but the server could not revoke the token: "
+                f"{error}"
+            )
+        else:
+            st.session_state.notice = "You have been signed out."
+        reset_session()
+        st.rerun()
+
+st.sidebar.markdown("# InnerEcho")
+st.sidebar.caption("YOUR SPACE")
+st.sidebar.radio(
+    "Navigation",
+    PAGES,
+    key="page",
+    label_visibility="collapsed",
+)
+st.sidebar.divider()
+st.sidebar.caption("A quiet place to reflect.")
+
+active_page = st.session_state.page
+if active_page == "Games":
+    active_page = st.radio(
+        "Choose a game",
+        ["Emotion game", "Emoji maker"],
+        horizontal=True,
+        key="games_section",
+    )
+
+if active_page == "Dashboard":
+    section_title(
+        "A SMALL CHECK-IN",
+        "Your day, in a few marks.",
+        "A little snapshot of what's been showing up lately.",
+    )
+    try:
+        history = api_request("GET", "/history", token=st.session_state.access_token)
+        mood_today = api_request(
+            "GET", "/mood-checkin", token=st.session_state.access_token
+        )
+        trends = api_request(
+            "GET",
+            "/insights/trends",
+            token=st.session_state.access_token,
+            params={"days": 30},
+        )
+        score = api_request(
+            "GET", "/game/score", token=st.session_state.access_token
+        )
+        daily = api_request(
+            "GET", "/game/daily-emoji", token=st.session_state.access_token
+        )
+        checkin_history = api_request(
+            "GET",
+            "/mood-checkin/history",
+            token=st.session_state.access_token,
+            params={"days": 30},
+        )
+    except APIError as error:
+        api_error_message(error)
+    else:
+        metric1, metric2, metric3 = st.columns(3)
+        metric1.metric("Text reflections", len(history))
+        metric2.metric("Check-in today", mood_today["checkin"]["mood"].title() if mood_today["checkin"] else "Not yet")
+        metric3.metric("Game points", score["score"], f"best streak {score['best_streak']}")
+
+        if history:
+            current_emotion = history[0].get("emotion", "neutral")
+            face_col, insight_col = st.columns([0.8, 1.8])
+            with face_col:
+                st.markdown(emotion_face_html(current_emotion, size=170), unsafe_allow_html=True)
+            with insight_col:
+                st.markdown("#### Current emotional mood")
+                st.markdown(f"**{emotion_label(current_emotion)}** is the most recent reflection.")
+                st.caption(history[0]["text"][:180] + ("..." if len(history[0]["text"]) > 180 else ""))
+
+        chart_col, note_col = st.columns([1.3, 1], gap="large")
+        with chart_col:
+            st.markdown("#### The last 30 days")
+            trend_rows = []
+            for item in trends["records"]:
+                trend_rows.append({"Date": item["date"], **item["counts"]})
+            if trend_rows:
+                frame = (
+                    pd.DataFrame(trend_rows)
+                    .set_index("Date")
+                    .reindex(columns=EMOTIONS, fill_value=0)
+                    .fillna(0)
+                )
+                st.line_chart(frame, color=["#e3ad6f", "#7a9cb7", "#cc806f", "#8390ad", "#6f9ca0", "#b18eaa", "#9babb5", "#ad9c85"])
+
+                history_points = []
+                for item in history:
+                    scores = item.get("scores", {}) or {}
+                    if not scores:
+                        continue
+                    intensity = max(float(score) for score in scores.values()) if scores else 0
+                    history_points.append(
+                        {
+                            "Date": pd.to_datetime(item["created_at"]).date(),
+                            "Emotion": item["emotion"],
+                            "Intensity": round(intensity, 1),
+                            "Text": (item["text"][:80] + "...") if len(item["text"]) > 80 else item["text"],
+                        }
+                    )
+                if history_points:
+                    scatter_df = pd.DataFrame(history_points)
+                    scatter_chart = alt.Chart(scatter_df).mark_circle(size=140).encode(
+                        x="Date:T",
+                        y="Intensity:Q",
+                        color="Emotion:N",
+                        tooltip=["Date:T", "Emotion:N", "Intensity:Q", "Text:N"],
+                    ).interactive()
+                    st.markdown("#### Emotional scatter")
+                    st.altair_chart(scatter_chart, use_container_width=True)
+            else:
+                st.markdown(
+                    '<div class="hand-note">Your trend line is still a blank page. '
+                    'That is a perfectly good place to begin.</div>',
+                    unsafe_allow_html=True,
+                )
+        with note_col:
+            st.markdown("#### Recent reflections")
+            if history:
+                for record in history[:4]:
+                    st.markdown(
+                        f"**{emotion_label(record['emotion'])}** · {record['created_at']}"
+                    )
+                    st.caption(record["text"][:96] + ("…" if len(record["text"]) > 96 else ""))
+                    st.divider()
+            else:
+                st.info("No text reflections yet.")
+        st.markdown("#### Today's little mission")
+        if daily["completed"]:
+            submission = daily["submission"]
+            st.success(
+                f"Your {submission['mood']} face is in the journal · "
+                f"{submission['reward']} points earned."
+            )
+        else:
+            st.write(f"Make a face for **{emotion_label(daily['goal'])}** in Emoji Maker.")
+        st.markdown(
+            '<div class="footer-note">A pattern is something to notice, not a verdict about you.</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("#### Today's mood check-in")
+        with st.form("dashboard_mood_checkin_form"):
+            checkin_mood = st.selectbox(
+                "How are you feeling today?",
+                EMOTIONS,
+                format_func=emotion_label,
+                index=EMOTIONS.index(mood_today["checkin"]["mood"])
+                if mood_today["checkin"]
+                else 0,
+            )
+            checkin_note = st.text_input(
+                "A short note (optional)",
+                value=mood_today["checkin"]["note"] if mood_today["checkin"] else "",
+                max_chars=500,
+            )
+            save_checkin = st.form_submit_button("Save check-in")
+        if save_checkin:
+            try:
+                api_request(
+                    "POST",
+                    "/mood-checkin",
+                    token=st.session_state.access_token,
+                    payload={"mood": checkin_mood, "note": checkin_note},
+                )
+                st.success("Check-in saved.")
+                st.rerun()
+            except APIError as error:
+                api_error_message(error)
+        if checkin_history:
+            st.markdown("#### Recent check-ins")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Date": item["checkin_date"],
+                            "Mood": emotion_label(item["mood"]),
+                            "Note": item["note"],
+                        }
+                        for item in checkin_history
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+elif active_page == "Emotion Detector":
+    section_title(
+        "NOTICE THE TONE",
+        "What might this text be carrying?",
+        "Type a reflection or record a voice note. You can add a source link for context.",
+    )
+    recording = st.audio_input("Record a voice note")
+    st.caption(
+        "Audio is transcribed on this computer. Only the transcript is sent to InnerEcho "
+        "for emotion analysis."
+    )
+    if recording and st.button("Transcribe recording", key="transcribe_recording"):
+        try:
+            with st.spinner("Transcribing locally... the speech model downloads the first time."):
+                transcript = transcribe_audio(recording.getvalue())
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            st.error(f"Local transcription failed: {error}")
+        else:
+            if transcript:
+                st.session_state.prediction_text = transcript[:5000]
+                st.success("Transcript added below. You can edit it before analyzing.")
+            else:
+                st.warning("No speech was detected. Try recording again.")
+
+    with st.form("prediction_form"):
+        text = st.text_area(
+            "Text to reflect on",
+            placeholder="A sentence, a message, a little piece of a day...",
+            max_chars=5000,
+            height=170,
+            key="prediction_text",
+        )
+        source_url = st.text_input(
+            "Source link (optional)", placeholder="https://example.com/article"
+        )
+        submitted = st.form_submit_button("Read the emotional tone")
+    if submitted:
+        if not text.strip():
+            st.warning("Add a little text first.")
+        elif not valid_source_url(source_url):
+            st.warning("The source link should start with http:// or https://.")
+        else:
+            try:
+                st.session_state.last_prediction = api_request(
+                    "POST",
+                    "/predict",
+                    token=st.session_state.access_token,
+                    payload={"text": text.strip(), "source_url": source_url.strip()},
+                )
+            except APIError as error:
+                api_error_message(error)
+            else:
+                st.rerun()
+    result = st.session_state.last_prediction
+    if result:
+        st.markdown(
+            f'<div class="eyebrow">A MODEL-BASED GUESS</div><div class="section-title">'
+            f'{emotion_label(result["emotion"])}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(emotion_face_html(result["emotion"], size=180), unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="result-slip">{escape(result["text"][:500])}</div>',
+            unsafe_allow_html=True,
+        )
+        if result.get("source_url"):
+            st.caption(f"Source noted: {result['source_url']}")
+        st.markdown("#### Score estimates")
+        for label, value in sorted(
+            result["scores"].items(), key=lambda item: item[1], reverse=True
+        ):
+            st.progress(
+                min(max(value / 100, 0), 1),
+                text=f"{emotion_label(label)} · {value:.1f}%",
+            )
+        st.caption(
+            "These are model scores, not calibrated probabilities or a certain reading "
+            "of anyone's feelings."
+        )
+
+elif active_page == "History":
+    section_title(
+        "YOUR SAVED REFLECTIONS",
+        "Mood tracker",
+        "A calmer view of what has been showing up lately.",
+    )
+    try:
+        records = api_request("GET", "/history", token=st.session_state.access_token)
+        mood_history = api_request(
+            "GET",
+            "/mood-checkin/history",
+            token=st.session_state.access_token,
+            params={"days": 30},
+        )
+    except APIError as error:
+        api_error_message(error)
+    else:
+        today_value = date.today().isoformat()
+        today_checkin = next((item for item in mood_history if item["checkin_date"] == today_value), None)
+        newest_emotion = today_checkin["mood"] if today_checkin else (records[0]["emotion"] if records else "neutral")
+
+        today_col, week_col = st.columns(2, gap="large")
+        with today_col:
+            today_note = today_checkin["note"] if today_checkin else "No check-in saved yet today."
+            st.markdown(
+                '<div class="tracker-card"><div class="tracker-card-title">Today\'s mood</div>'
+                '<div class="tracker-card-subtitle">' + escape(today_value) + '</div>'
+                '<div style="font-size:30px">' + escape(EMOJIS.get(newest_emotion, "🫧")) +
+                '</div><strong>' + escape(emotion_label(newest_emotion).split(" ", 1)[-1]) +
+                '</strong><div class="tracker-card-subtitle" style="margin-top:8px;margin-bottom:0">' +
+                escape(today_note) + '</div></div>',
+                unsafe_allow_html=True,
+            )
+        with week_col:
+            week_counts = pd.Series([item["mood"] for item in mood_history]).value_counts() if mood_history else pd.Series(dtype="int64")
+            chips = "".join(
+                '<div class="mood-chip"><div class="mood-chip-dot">' +
+                escape(EMOJIS.get(emotion, "🫧")) + '</div>' +
+                escape(str(count)) + '</div>'
+                for emotion, count in week_counts.head(5).items()
+            )
+            if not chips:
+                chips = '<div class="mood-chip"><div class="mood-chip-dot">🫧</div>0</div>'
+            st.markdown(
+                '<div class="tracker-card"><div class="tracker-card-title">Weekly mood trend</div>'
+                '<div class="tracker-card-subtitle">Your last 30 days at a glance</div>'
+                '<div class="mood-legend">' + chips + '</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        chart_col, list_col = st.columns([1.45, 1], gap="large")
+        with chart_col:
+            st.markdown('<div class="tracker-card">', unsafe_allow_html=True)
+            st.markdown('<div class="tracker-card-title">Daily mood trend</div><div class="tracker-card-subtitle">Mood check-ins from the last 14 days</div>', unsafe_allow_html=True)
+            end_date = pd.Timestamp.today().normalize()
+            date_index = pd.date_range(end=end_date, periods=14)
+            daily_rows = {d.strftime("%Y-%m-%d"): 0 for d in date_index}
+            checkin_dates = {}
+            for item in mood_history:
+                key = str(item["checkin_date"])
+                checkin_dates[key] = item["mood"]
+            chart_rows = []
+            emotion_colors = {
+                "joy": "#efb8c8", "sadness": "#8eb5c9", "anger": "#f29a8b",
+                "fear": "#9fb0d7", "love": "#78bea7", "surprise": "#b8a1d6",
+                "neutral": "#a9bdc8", "uncertain": "#d2c194",
+            }
+            for d in date_index:
+                key = d.strftime("%Y-%m-%d")
+                mood = checkin_dates.get(key)
+                chart_rows.append({"Day": d.strftime("%d"), "DayOrder": d, "Mood": mood or "No check-in", "Count": 1 if mood else 0})
+            if chart_rows:
+                chart_frame = pd.DataFrame(chart_rows)
+                mood_chart = alt.Chart(chart_frame).mark_bar(size=16, cornerRadiusTopLeft=8, cornerRadiusTopRight=8).encode(
+                    x=alt.X("Day:N", title=None, sort=list(chart_frame["Day"])),
+                    y=alt.Y("Count:Q", title=None, axis=alt.Axis(ticks=False, labels=False, grid=False)),
+                    color=alt.Color(
+                        "Mood:N",
+                        scale=alt.Scale(domain=list(emotion_colors.keys()) + ["No check-in"], range=list(emotion_colors.values()) + ["#edf1ec"]),
+                        legend=None,
+                    ),
+                    tooltip=["Day:N", "Mood:N"],
+                ).properties(height=230)
+                st.altair_chart(mood_chart, use_container_width=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with list_col:
+            st.markdown('<div class="tracker-card">', unsafe_allow_html=True)
+            st.markdown('<div class="tracker-card-title">Your reflections</div><div class="tracker-card-subtitle">Saved text analysis</div>', unsafe_allow_html=True)
+            if records:
+                for record in records[:5]:
+                    emotion = record.get("emotion", "neutral")
+                    text = record["text"].replace("\n", " ")
+                    short_text = text[:100] + ("..." if len(text) > 100 else "")
+                    st.markdown(
+                        '<div class="reflection-row"><strong>' + escape(EMOJIS.get(emotion, "🫧") + " " + emotion.title()) +
+                        '</strong><div class="tracker-card-subtitle" style="margin:4px 0">' + escape(str(record["created_at"])) +
+                        '</div><div style="font-size:12px;color:#607a68">' + escape(short_text) + "</div></div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("Your saved reflections will appear here.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        controls = st.columns([1, 1])
+        with controls[0]:
+            if records:
+                history_frame = pd.DataFrame([
+                    {
+                        "Date": item["created_at"],
+                        "Text": item["text"],
+                        "Emotion": item["emotion"],
+                        "Intensity": round(max((score for score in (item.get("scores") or {}).values()), default=0), 1),
+                        "Source": item.get("source_url", ""),
+                    }
+                    for item in records
+                ])
+                st.download_button(
+                    "Download history as CSV",
+                    history_frame.assign(Emotion=history_frame["Emotion"].map(emotion_label)).to_csv(index=False).encode("utf-8"),
+                    "innerecho_history.csv",
+                    "text/csv",
+                    use_container_width=True,
+                )
+        with controls[1]:
+            if records and st.button("Clear my history", use_container_width=True):
+                try:
+                    api_request("DELETE", "/history", token=st.session_state.access_token)
+                    st.success("History cleared.")
+                    st.rerun()
+                except APIError as error:
+                    api_error_message(error)
+
+elif active_page == "Emotion game":
+    section_title(
+        "A QUICK PRACTICE ROUND",
+        "Can you read between the lines?",
+        "A tiny game for noticing emotional cues. There is no score to prove anything.",
+    )
+    try:
+        score = api_request("GET", "/game/score", token=st.session_state.access_token)
+    except APIError as error:
+        api_error_message(error)
+        score = None
+    if score:
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Points", score["score"])
+        s2.metric("Current streak", score["streak"])
+        s3.metric("Best streak", score["best_streak"])
+    if st.session_state.game_question is None:
+        if st.button("Deal me a sentence"):
+            try:
+                st.session_state.game_question = api_request(
+                    "POST", "/game/next", token=st.session_state.access_token
+                )
+                st.session_state.game_feedback = None
+                st.rerun()
+            except APIError as error:
+                api_error_message(error)
+    question = st.session_state.game_question
+    if question:
+        st.markdown(
+            f'<div class="hand-note">“{escape(question["text"])}”</div>',
+            unsafe_allow_html=True,
+        )
+        feedback = st.session_state.game_feedback
+        if feedback:
+            answer = emotion_label(feedback["answer"])
+            if feedback["correct"]:
+                st.success(f"That's it — {answer}. Ten points for noticing.")
+            else:
+                st.info(f"A different reading was {answer}. More than one feeling can fit.")
+            if st.button("Deal the next sentence"):
+                try:
+                    st.session_state.game_question = api_request(
+                        "POST", "/game/next", token=st.session_state.access_token
+                    )
+                    st.session_state.game_feedback = None
+                    st.rerun()
+                except APIError as error:
+                    api_error_message(error)
+        else:
+            guess = st.selectbox(
+                "What feeling might be closest?",
+                question["labels"],
+                format_func=emotion_label,
+            )
+            left, right = st.columns(2)
+            with left:
+                if st.button("Lock in my guess", use_container_width=True):
+                    try:
+                        st.session_state.game_feedback = api_request(
+                            "POST",
+                            "/game/guess",
+                            token=st.session_state.access_token,
+                            payload={"game_id": question["game_id"], "guess": guess},
+                        )
+                        st.rerun()
+                    except APIError as error:
+                        api_error_message(error)
+            with right:
+                if st.button("Try another one", use_container_width=True):
+                    try:
+                        st.session_state.game_question = api_request(
+                            "POST", "/game/next", token=st.session_state.access_token
+                        )
+                        st.session_state.game_feedback = None
+                        st.rerun()
+                    except APIError as error:
+                        api_error_message(error)
+
+elif active_page == "Emoji maker":
+    section_title(
+        "A FACE FOR THE FEELING",
+        "Make today's little character.",
+        "Pick a mood, eyes, a mouth, and an extra. The daily mission is optional.",
+    )
+    try:
+        daily = api_request(
+            "GET", "/game/daily-emoji", token=st.session_state.access_token
+        )
+    except APIError as error:
+        api_error_message(error)
+        daily = None
+    col_preview, col_choices = st.columns([.9, 1.2], gap="large")
+    with col_choices:
+        saved_face = daily["submission"] if daily and daily["completed"] else {}
+        face_mood = st.selectbox(
+            "Mood",
+            EMOTIONS,
+            format_func=emotion_label,
+            index=EMOTIONS.index(saved_face["mood"]) if saved_face else 0,
+        )
+        face_color = st.selectbox(
+            "Face color",
+            FACE_COLORS,
+            format_func=lambda color: {
+                "#f3cf9b": "warm apricot", "#eab5a7": "soft rose",
+                "#c5d6bd": "sage", "#c3d4e2": "mist blue",
+                "#d5c6dc": "lilac", "#e5d9b9": "oat",
+            }[color],
+            index=FACE_COLORS.index(saved_face["face_color"])
+            if saved_face and saved_face["face_color"] in FACE_COLORS
+            else 0,
+        )
+        eyes = st.selectbox(
+            "Eyes",
+            FACE_EYES,
+            index=FACE_EYES.index(saved_face["eyes"]) if saved_face else 0,
+        )
+        mouth = st.selectbox(
+            "Mouth",
+            FACE_MOUTHS,
+            index=FACE_MOUTHS.index(saved_face["mouth"]) if saved_face else 0,
+        )
+        accessory = st.selectbox(
+            "Little extra",
+            FACE_ACCESSORIES,
+            index=FACE_ACCESSORIES.index(saved_face["accessory"])
+            if saved_face
+            else 0,
+        )
+    with col_preview:
+        accessory_mark = {"none": "", "tiny star": "✦", "leaf": "❧", "cap": "⌒"}[accessory]
+        st.markdown(
+            f'<div class="custom-face" style="background:{face_color}">'
+            f'<span style="font-size:19px;position:absolute;margin-top:-74px;margin-left:53px;color:#587d9e">{accessory_mark}</span>'
+            f'<div style="text-align:center;color:#20364c;line-height:1.3">'
+            f'<div style="font-size:25px;letter-spacing:8px">{eyes}</div>'
+            f'<div style="font-size:34px;margin-top:-1px">{mouth}</div></div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(f"<center><b>{emotion_label(face_mood)}</b></center>", unsafe_allow_html=True)
+    if daily:
+        if daily["completed"]:
+            st.success(f"You've finished today's mission and earned {daily['submission']['reward']} points.")
+        else:
+            st.caption(f"Today's mission: make a face that fits **{emotion_label(daily['goal'])}**.")
+            if st.button("Save my face for today's mission"):
+                try:
+                    result = api_request(
+                        "POST",
+                        "/game/daily-emoji",
+                        token=st.session_state.access_token,
+                        payload={
+                            "mood": face_mood,
+                            "eyes": eyes,
+                            "mouth": mouth,
+                            "accessory": accessory,
+                            "face_color": face_color,
+                        },
+                    )
+                    if result["reward"]:
+                        st.success("Nice match — you earned 10 points!")
+                    else:
+                        st.info(f"Mission saved. Today's match was {emotion_label(result['goal'])}.")
+                    st.rerun()
+                except APIError as error:
+                    api_error_message(error)
+
+elif active_page == "Feedback":
+    section_title(
+        "A NOTE FOR THE MAKER",
+        "What would make this space better?",
+        "A short note or rating helps shape the next version.",
+    )
+    with st.form("feedback_form"):
+        rating = st.slider("How did this visit feel?", 1, 5, 4, format="%d / 5")
+        message = st.text_area("Your note", max_chars=2000, height=130)
+        submitted = st.form_submit_button("Send it along")
+    if submitted:
+        if not message.strip():
+            st.warning("Leave a few words so I know what the rating means.")
+        else:
+            try:
+                api_request(
+                    "POST",
+                    "/feedback",
+                    token=st.session_state.access_token,
+                    payload={"rating": rating, "message": message.strip()},
+                )
+                st.success("Thank you. Your note has been saved.")
+            except APIError as error:
+                api_error_message(error)
+
+st.markdown(
+    '<div class="footer-note">INNER ECHO · A LEARNING PROJECT · '
+    'NOT A CLINICAL TOOL · TAKE WHAT HELPS, LEAVE THE REST</div>',
+    unsafe_allow_html=True,
+)
